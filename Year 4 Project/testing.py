@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import sys
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import torch, time, numpy as np
 from torch.quantization import quantize_dynamic
 from torch.utils.data import DataLoader
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from nltk.tokenize import word_tokenize
 import nltk
 nltk.download('punkt')
@@ -13,6 +14,14 @@ from sklearn.metrics import f1_score
 import re, pandas as pd
 from sklearn.model_selection import train_test_split
 import gc, json, os
+
+
+
+if len(sys.argv) > 1:
+    mode = sys.argv[1]  # "generating" or "testing"
+    print(f"Running in {mode} mode.")
+else:
+    print("No mode specified.")
 
 
 def preprocess_text(text):
@@ -131,23 +140,46 @@ def generate_response(question, model, tokenizer):
 
     return response
 
-def generate_and_save_questions(n, test_dataset, model, tokenizer, model_name):
-    # Shuffle the dataset
-    # test_dataset = test_dataset.shuffle()
-
-    # Create a filename based on the current timestamp
+def generate_and_save_questions(n, test_dataset, model_path, tokenizer, custom_model = True):
+    # Create a filename based on the current timestamp and model
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    filename = f"Saved Responses/questions_{timestamp}.json"
+    if custom_model:
+        filename = "Saved Responses/" + model_path.replace("model/", "") + ".json"
+    else:
+        filename = "Saved Responses/original/" + model_path + "/original.json"
+    
+    print(f"Filename is {filename}")
+
+    # Ensure directory exists, create if not
+    directory = os.path.dirname(filename)
+    print(f"Directory is {directory}")
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        print(f"Directory made at {directory}")
+
+    loading_start = time.time()
+    # Load the trained model
+    if custom_model:
+        model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=BitsAndBytesConfig(
+                device_map="auto",
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=False,
+            ),
+            torch_dtype=torch.bfloat16,
+        )
+
+    loading_end = time.time()
+    print(f"Model: {model_path} loaded in {loading_end - loading_start:.2f} seconds")
+
 
     # Initialize a list to hold our question-answer-response dictionaries
     questions_responses = []
-    
-    
-    # Ensure directory exists, create if not
-    directory = os.path.dirname(filename)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
     successful_responses = 0
 
     for i in range(n):
@@ -167,6 +199,7 @@ def generate_and_save_questions(n, test_dataset, model, tokenizer, model_name):
         try:
             with torch.no_grad():
                 response = generate_response(question, model, tokenizer)
+                response = remove_question_from_response(response, question)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
                 print("CUDA OOM occurred!")
@@ -207,7 +240,7 @@ def generate_and_save_questions(n, test_dataset, model, tokenizer, model_name):
         with open(filename, "w") as file:
             json.dump({
                 "metadata": {
-                    "model_name": model_name,
+                    "model_name": model_path,
                     "timestamp": timestamp,
                     "total_questions": n,
                     "successful_responses": successful_responses
@@ -239,6 +272,10 @@ def load_json_data(file_path):
     with open(file_path, 'r') as file:
         return json.load(file)
 
+def remove_question_from_response(string, substring):
+    pattern = re.escape(substring) + r"\n*"
+    return re.sub(pattern, "", string)
+
 def calculate_perplexity(model, tokenizer, text):
     tokenize_input = tokenizer(text, return_tensors="pt", truncation=True).to(device)
     with tokenizer.as_target_tokenizer():
@@ -247,27 +284,60 @@ def calculate_perplexity(model, tokenizer, text):
     return torch.exp(loss).item()
 
 
-def calculate_and_compare_perplexity(model, tokenizer, train_df, test_df):
-    print("Starting Perplexity Test")
-    results_dir = os.path.join("results", "other")
-    os.makedirs(results_dir, exist_ok=True)
+def calculate_and_compare_perplexity(model_path, tokenizer, train_df, test_df, custom):
+    loading_start = time.time()
+    # Load the trained model
+    model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+    loading_end = time.time()
+    print(f"Model loaded in {loading_end - loading_start:.2f} seconds")
     
-    results_path = os.path.join(results_dir, "perplexity.txt")
-    with open(results_path, 'w') as results_file:
-        train_avg_perplexity = perplexity_df(model, tokenizer, train_df, results_file, 'Train')
-        test_avg_perplexity = perplexity_df(model, tokenizer, test_df, results_file, 'Test')
-        
-        results_file.write(f"Average Perplexity for Training Data: {train_avg_perplexity}\n")
-        results_file.write(f"Average Perplexity for Testing Data: {test_avg_perplexity}\n")
-        results_file.write(f"Difference in Average Perplexity: {abs(train_avg_perplexity - test_avg_perplexity)}\n")
+    
+    print("Starting Perplexity Test")
+    train_avg_perplexity, train_results = perplexity_df(model, tokenizer, train_df)
+    test_avg_perplexity, test_results = perplexity_df(model, tokenizer, test_df)
 
-        print(f"Average Perplexity for Training Data: {train_avg_perplexity}")
-        print(f"Average Perplexity for Testing Data: {test_avg_perplexity}")
-        print(f"Difference in Average Perplexity: {abs(train_avg_perplexity - test_avg_perplexity)}")
+    results = {
+    "metadata": {
+        "average_perplexity": {
+            "training_data": train_avg_perplexity,
+            "testing_data": test_avg_perplexity,
+            "difference": abs(train_avg_perplexity - test_avg_perplexity)
+        },
+        "model_info": model_path,
+    },
+    "train_data": train_results,
+    "test_data": test_results
+}
+    
+    if custom: 
+        model_name = model_path.replace("model/", "")
+    else:
+        model_name = "original/" + model_path
+
+    results_dir = os.path.join("results", model_name)
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, "perplexity.json")
+
+    with open(results_path, 'w') as results_file:
+        json.dump(results, results_file, indent=4)
+
+
+
+    # with open(results_path, 'w') as results_file:
+
+        
+    #     results_file.write(f"Average Perplexity for Training Data: {train_avg_perplexity}\n")
+    #     results_file.write(f"Average Perplexity for Testing Data: {test_avg_perplexity}\n")
+    #     results_file.write(f"Difference in Average Perplexity: {abs(train_avg_perplexity - test_avg_perplexity)}\n")
+
+    print(f"Average Perplexity for Training Data: {train_avg_perplexity}")
+    print(f"Average Perplexity for Testing Data: {test_avg_perplexity}")
+    print(f"Difference in Average Perplexity: {abs(train_avg_perplexity - test_avg_perplexity)}")
     
     print("Ending Perplexity Test")
 
-def perplexity_df(model, tokenizer, df, results_file, dataset_name):
+def perplexity_df(model, tokenizer, df):
+    results = []
     total_perplexity = 0
     for index, row in df.iterrows():
         question = row["question"]
@@ -276,11 +346,13 @@ def perplexity_df(model, tokenizer, df, results_file, dataset_name):
         answer_perplexity = calculate_perplexity(model, tokenizer, answer)
         total_perplexity += answer_perplexity
         
-        results_file.write(f"{dataset_name} Question: {question}\n")
-        results_file.write(f"{dataset_name} Answer Perplexity: {answer_perplexity}\n\n")
+        results.append({
+            "question": question,
+            "answer_perplexity": answer_perplexity
+        })
         
     avg_perplexity = total_perplexity / len(df)
-    return avg_perplexity
+    return avg_perplexity, results
 
 def calculate_bleu(reference, candidate):
     """
@@ -288,10 +360,11 @@ def calculate_bleu(reference, candidate):
     """
     reference_tokens = word_tokenize(reference.lower())
     candidate_tokens = word_tokenize(candidate.lower())
-    score = sentence_bleu([reference_tokens], candidate_tokens)
+    smoothing = SmoothingFunction().method1
+    score = sentence_bleu([reference_tokens], candidate_tokens, smoothing_function = smoothing)
     return score
 
-def test_bleu_score(json_file_path):
+def test_bleu_score(json_file_path, custom):
     """
     Test the BLEU score for responses in a JSON file.
     """
@@ -299,13 +372,14 @@ def test_bleu_score(json_file_path):
     print("Starting BLEU Test")
     data = load_json_data(json_file_path)
 
-    # Ensure the results directory exists
-    timestamp = data['metadata']['timestamp']
-    results_dir = os.path.join("results", timestamp)
+    # Ensure the results directory exists  
+    if custom: 
+        results_dir = "results/" + json_file_path.replace("Saved Responses/", "").replace(".json", "")
+    else:
+        results_dir = "results/" + json_file_path.replace("Saved Responses/", "").replace("/original.json", "")
     os.makedirs(results_dir, exist_ok=True)
-    
-    # Prepare to save the results
     results_path = os.path.join(results_dir, "bleu_scores.json")
+    
     print("BLEU Score Test Start:")
     bleu_total = 0
     bleu_results = []
@@ -315,7 +389,9 @@ def test_bleu_score(json_file_path):
     for item in data["data"]:
         if item["successful"]:
             answer = item["answer"]
+            question = item["question"]
             generated_response = item["generated_response"]
+            generated_response = remove_question_from_response(generated_response, question)
             
             bleu_score = calculate_bleu(answer, generated_response)
             bleu_total += bleu_score  # Append blue score to the list
@@ -351,7 +427,7 @@ def calculate_rouge(reference, candidate):
     scores = scorer.score(reference, candidate)
     return scores
 
-def test_rouge_score(json_file_path):
+def test_rouge_score(json_file_path, custom):
     """
     Test the ROUGE score for responses in a JSON file.
     """
@@ -360,12 +436,14 @@ def test_rouge_score(json_file_path):
     data = load_json_data(json_file_path)
 
     # Ensure the results directory exists
-    timestamp = data['metadata']['timestamp']
-    results_dir = os.path.join("results", timestamp)
+    if custom: 
+        results_dir = "results/" + json_file_path.replace("Saved Responses/", "").replace(".json", "")
+    else:
+        results_dir = "results/" + json_file_path.replace("Saved Responses/", "").replace("/original.json", "")
     os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, "rouge.json")
     
     # Prepare to save the results
-    results_path = os.path.join(results_dir, "rouge.json")
     rouge_results = []
     rouge_1_total = 0
     rouge_2_total = 0
@@ -377,7 +455,9 @@ def test_rouge_score(json_file_path):
     for item in data["data"]:
         if item["successful"]:
             answer = item["answer"]
+            question = item["question"]
             generated_response = item["generated_response"]
+            generated_response = remove_question_from_response(generated_response, question)
 
             
             rouge_scores = calculate_rouge(answer, generated_response)
@@ -453,15 +533,14 @@ start_time = time.time()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+custom = False
 
-
-loading_start = time.time()
-# Load the trained model
-model_path = "model/20240222-022652"
-model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
-loading_end = time.time()
-print(f"Model loaded in {loading_end - loading_start:.2f} seconds")
-
+if custom:
+    model_path = "model/custom/meta-llama/Llama-2-13b-chat-hf/20240222-022652"
+    test_file_path = "Saved Responses/custom/meta-llama/Llama-2-13b-chat-hf/20240222-022652.json"
+else: 
+    model_path = "meta-llama/Llama-2-13b-chat-hf"
+    test_file_path = "Saved Responses/original/meta-llama/Llama-2-7b-chat-hf/original.json"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -479,11 +558,15 @@ train_dataset, val_dataset, test_dataset = split_dataset(df)
 
 print("Loaded Dataset")
 
-# Generate JSON of questions
-generate_and_save_questions(750, test_dataset, model, tokenizer, model_name=model_path)
+if mode == "generating":
+    # Needs Ampere
+    generate_and_save_questions(500, test_dataset, model_path, tokenizer, custom_model=custom)
 
-# Tests
-calculate_and_compare_perplexity(model, tokenizer, train_dataset, test_dataset)
-test_bleu_score("Saved Responses/questions_20240322-030647.json")
-test_rouge_score("Saved Responses/questions_20240322-030647.json")
+if mode == "testing": 
+    # Needs Ampere
+    calculate_and_compare_perplexity(model_path, tokenizer, train_dataset, test_dataset, custom)
+
+    # Need turing only
+    test_bleu_score(test_file_path, custom)
+    test_rouge_score(test_file_path, custom)
 
