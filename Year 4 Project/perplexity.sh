@@ -4,7 +4,7 @@
 #SBATCH -c 4
 
 
-#SBATCH -t 01:00:00
+#SBATCH -t 06:00:00
 #SBATCH -p ug-gpu-small
 #SBATCH --qos=short
 #SBATCH --mem=28g
@@ -22,6 +22,6 @@ source /etc/profile
 # Run your program (replace this with your program)
 cd $HOME/Year\ 4\ Project/
 
-./testing_perplexity.py
+./testing.py testing
 
 echo "Complete"
